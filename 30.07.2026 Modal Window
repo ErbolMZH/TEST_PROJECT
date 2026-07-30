@@ -1,0 +1,574 @@
+package api
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+
+	"your_project/comps"
+	"your_project/logger"
+	"your_project/model"
+	"your_project/pg"
+)
+
+// 📌 1. Константа БИН нашей организации
+const SenderBIN = "123456789012" // Укажите реальный 12-значный БИН вашего банка/системы
+
+// 📌 2. Структура запроса к внешнему API
+type ExternalInquiryPayload struct {
+	BIN            string                 `json:"bin"`            // Наш БИН (SenderBIN)
+	Type           string                 `json:"type,omitempty"` // MANUAL
+	Subject        string                 `json:"subject,omitempty"`
+	AdditionalData map[string]interface{} `json:"additionalData,omitempty"`
+}
+
+// 📌 3. Хэндлер создания запроса (Echo)
+func CreateInquiryHandler(c echo.Context) error {
+	incidentID := c.Param("id")
+	if incidentID == "" {
+		logger.Log("WARN", "inquiry_handler", "NULL", "Incident ID is required", nil)
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Incident ID is required"})
+	}
+
+	// --- ШАГ 1: Чтение текстовых полей из multipart/form-data ---
+	targetBIN := strings.TrimSpace(c.FormValue("target_bin")) // БИН получателя (r.code)
+	description := strings.TrimSpace(c.FormValue("description"))
+	inquiryType := strings.TrimSpace(c.FormValue("type"))
+
+	if inquiryType == "" {
+		inquiryType = "MANUAL"
+	}
+
+	if targetBIN == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Необходимо выбрать целевую организацию (БИН)"})
+	}
+	if description == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Описание запроса не может быть пустым"})
+	}
+
+	// --- ШАГ 2: Обработка и валидация файла ---
+	fileHeader, err := c.FormFile("file")
+	var fileBytes []byte
+	var fileName string
+	var fileBase64 string
+
+	if err == nil && fileHeader != nil {
+		// 1. Проверка размера файла (10 МБ = 10 * 1024 * 1024 байт)
+		const maxFileSize = 10 * 1024 * 1024
+		if fileHeader.Size > maxFileSize {
+			logger.Log("WARN", "inquiry_handler", incidentID, fmt.Sprintf("File size too large: %d bytes", fileHeader.Size), nil)
+			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Размер файла превышает максимально допустимый (10 МБ)"})
+		}
+
+		// 2. Проверка разрешения / расширения файла
+		ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
+		allowedExts := map[string]bool{
+			".png":  true,
+			".jpg":  true,
+			".jpeg": true,
+			".pdf":  true,
+		}
+
+		if !allowedExts[ext] {
+			logger.Log("WARN", "inquiry_handler", incidentID, fmt.Sprintf("Invalid file extension: %s", ext), nil)
+			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Разрешены только файлы форматов PNG, JPG, JPEG и PDF"})
+		}
+
+		// 3. Считывание содержимого файла в память
+		src, err := fileHeader.Open()
+		if err != nil {
+			logger.Log("ERROR", "inquiry_handler", incidentID, "Failed to open uploaded file", err)
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Не удалось открыть прикрепленный файл"})
+		}
+		defer src.Close()
+
+		fileBytes, err = io.ReadAll(src)
+		if err != nil {
+			logger.Log("ERROR", "inquiry_handler", incidentID, "Failed to read uploaded file", err)
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Ошибка при чтении файла"})
+		}
+
+		fileName = fileHeader.Filename
+		// Кодируем файл в Base64 для передачи в JSON во внешний сервис (если требуется внешним API)
+		fileBase64 = base64.StdEncoding.EncodeToString(fileBytes)
+	}
+
+	// --- ШАГ 3: Проверка и обновление токена авторизации ---
+	authData, _ := model.AFGetAuthStruct()
+	secAfterTokenCreation := int(time.Since(authData.CreatedAt).Seconds())
+	if secAfterTokenCreation >= authData.RefreshExpiresIn {
+		var err error
+		authData, _, err = model.AFAuth(`create_inquiry token expired`)
+		if err != nil {
+			logger.Log("ERROR", "inquiry_handler", incidentID, fmt.Sprintf("AFAuth fiasco: %s", err), err)
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Authentication failed"})
+		}
+	}
+	model.AFGlobalAuthData = authData
+
+	// --- ШАГ 4: Формирование Payload для внешнего сервиса ---
+	additionalData := map[string]interface{}{
+		"receiver_bin": targetBIN,   // БИН организации-получателя
+		"description":  description, // Запрашиваемая информация
+	}
+
+	// Если файл был загружен, добавляем информацию о нем
+	if fileName != "" {
+		additionalData["file_name"] = fileName
+		additionalData["file_content"] = fileBase64 // Base64 файла
+	}
+
+	reqPayload := ExternalInquiryPayload{
+		BIN:            SenderBIN,
+		Type:           inquiryType,
+		Subject:        "Запрос информации по инциденту",
+		AdditionalData: additionalData,
+	}
+
+	jsonPayload, err := json.Marshal(reqPayload)
+	if err != nil {
+		logger.Log("ERROR", "inquiry_handler", incidentID, fmt.Sprintf("failed to marshal payload: %s", err), err)
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to prepare payload"})
+	}
+
+	// --- ШАГ 5: Отправка HTTP-запроса во внешний сервис ---
+	targetURL := comps.Config.AF.APIURL + `/external/v1/incidents/` + incidentID + `/inquiries`
+	body, status, err := sendPostInquiry(targetURL, jsonPayload, authData.Access)
+	if err != nil {
+		logger.Log("ERROR", "inquiry_handler", incidentID, fmt.Sprintf("sendPostInquiry fiasco: %s", err), err)
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to connect to external service"})
+	}
+
+	if status == http.StatusUnauthorized {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "Unauthorized in external service"})
+	}
+
+	// --- ШАГ 6: Сохранение результата в PostgreSQL при успешном ответе ---
+	if status >= 200 && status < 300 {
+		errRaw := SaveCreateInquiryRawTarget(reqPayload, body, status, incidentID)
+		if errRaw != nil {
+			logger.Log("ERROR", "inquiry_handler", incidentID, fmt.Sprintf("SaveCreateInquiryRawTarget fiasco: %s", errRaw), errRaw)
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to save inquiry data"})
+		}
+
+		return c.JSON(http.StatusOK, echo.Map{
+			"message": "Inquiry created successfully",
+			"status":  status,
+		})
+	}
+
+	// Обработка ошибок внешнего сервиса
+	return c.JSON(status, echo.Map{
+		"error":   "External service error",
+		"status":  status,
+		"details": string(body),
+	})
+}
+
+// 📌 4. Вспомогательная функция отправки POST-запроса
+func sendPostInquiry(url string, jsonPayload []byte, token string) ([]byte, int, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return body, resp.StatusCode, nil
+}
+
+// 📌 5. Сохранение полного структуры JSON в БД и вызов процедуры PL/pgSQL
+func SaveCreateInquiryRawTarget(reqPayload ExternalInquiryPayload, responseBody []byte, status int, incidentID string) error {
+	// Извлекаем чистый ID из ответа внешнего сервиса (например, "c4dds153d1s35fd3")
+	cleanRespID := strings.Trim(strings.TrimSpace(string(responseBody)), "\"")
+
+	// Собираем полный валидный JSON-объект для хранения в колонке `json_`
+	fullRecord := map[string]interface{}{
+		"id":             cleanRespID,
+		"incident_id":    incidentID,
+		"bin":            reqPayload.BIN,
+		"type":           reqPayload.Type,
+		"subject":        reqPayload.Subject,
+		"additionalData": reqPayload.AdditionalData,
+		"status":         status,
+	}
+
+	jsonBytes, err := json.Marshal(fullRecord)
+	if err != nil {
+		return fmt.Errorf("failed to marshal full inquiry record: %w", err)
+	}
+
+	// 1. Вставляем подготовленный JSON в таблицу `inquiries_json`
+	q := `INSERT INTO inquiries_json(json_, status, incident_id) VALUES($1::json, $2, $3);`
+	_, err = pg.DB().Exec(q, string(jsonBytes), status, incidentID)
+	if err != nil {
+		logger.Log("ERROR", "SaveCreateInquiryRawTarget", incidentID, fmt.Sprintf("failed to insert raw inquiries JSON: %s", err), err)
+		return fmt.Errorf("failed to insert raw inquiries JSON: %w", err)
+	}
+
+	// 2. Вызываем процедуру парсинга
+	callProceduryQuery := `CALL public.p_prc_inquiries_json();`
+	_, err = pg.DB().Exec(callProceduryQuery)
+	if err != nil {
+		logger.Log("ERROR", "SaveCreateInquiryRawTarget", incidentID, fmt.Sprintf("Failed to execute p_prc_inquiries_json(): %s", err), err)
+		return fmt.Errorf("Failed to execute p_prc_inquiries_json(): %w", err)
+	}
+
+	return nil
+}
+
+
+
+
+// Handler для получения данных инцидента
+func GetIncidentHandler(c echo.Context) error {
+	incidentID := c.Param("id")
+
+	// SQL-запрос для получения связанных организаций (название + code из refs)
+	query := `
+		SELECT 
+			i.incident_id, 
+			COALESCE(i.organization_name, '') AS organization_name, 
+			COALESCE(r.code, '') AS code
+		FROM incident_related i 
+		LEFT JOIN refs r ON i.organization_name = r.name_ru 
+		WHERE i.incident_id = $1;
+	`
+
+	rows, err := pg.DB().Query(query, incidentID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Database error"})
+	}
+	defer rows.Close()
+
+	type RelatedOrg struct {
+		IncidentID       string `json:"incident_id"`
+		OrganizationName string `json:"organization_name"`
+		Code             string `json:"code"` // БИН из refs.code
+	}
+
+	var relatedOrgs []RelatedOrg
+	for rows.Next() {
+		var org RelatedOrg
+		if err := rows.Scan(&org.IncidentID, &org.OrganizationName, &org.Code); err == nil {
+			relatedOrgs = append(relatedOrgs, org)
+		}
+	}
+
+	// Отдаем JSON на фронтенд
+	return c.JSON(http.StatusOK, echo.Map{
+		"incident": echo.Map{
+			"id":               incidentID,
+			"incident_related": relatedOrgs, // 👈 ВОТ ЗДЕСЬ они отправляются на фронт!
+		},
+	})
+}
+
+
+
+
+<!-- Кнопка вызова модалки (размещается в карточке инцидента) -->
+<button class="btn btn-primary" @click="openInquiryModal">
+    Создать запрос информации
+</button>
+
+<!-- Модальное окно -->
+<div v-if="showInquiryModal" class="modal-backdrop" @click.self="closeInquiryModal">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            
+            <div class="modal-header">
+                <h4 class="modal-title">Новый запрос информации</h4>
+                <button type="button" class="close" @click="closeInquiryModal">&times;</button>
+            </div>
+
+            <form @submit.prevent="submitInquiry">
+                <div class="modal-body">
+                    
+                    <!-- 1. Выбор связанной организации -->
+                    <div class="form-group">
+                        <label>Связанная организация <span class="text-danger">*</span></label>
+                        <select v-model="newInquiry.targetBin" class="form-control" required>
+                            <option :value="null" disabled>-- Выберите организацию --</option>
+                            <option 
+                                v-for="(org, idx) in (incident.incident_related || [])" 
+                                :key="org.code || idx" 
+                                :value="org.code">
+                                {{ org.organization_name }} <template v-if="org.code">(БИН: {{ org.code }})</template>
+                            </option>
+                        </select>
+                        <small v-if="!incident.incident_related || incident.incident_related.length === 0" class="text-warning">
+                            Связанные организации не найдены для данного инцидента.
+                        </small>
+                    </div>
+
+                    <!-- 2. Описание запроса -->
+                    <div class="form-group">
+                        <label>Запрашиваемая информация <span class="text-danger">*</span></label>
+                        <textarea 
+                            v-model="newInquiry.description" 
+                            class="form-control" 
+                            rows="4" 
+                            placeholder="Укажите детальное описание запрашиваемых сведений..." 
+                            required>
+                        </textarea>
+                    </div>
+
+                    <!-- 3. Прикрепление файла -->
+                    <div class="form-group">
+                        <label>Прикрепить документ/фото</label>
+                        <input 
+                            type="file" 
+                            ref="fileInput" 
+                            class="form-control-file" 
+                            accept=".png, .jpg, .jpeg, .pdf" 
+                            @change="handleFileUpload">
+                        <small class="form-text text-muted">
+                            Разрешенные форматы: PNG, JPG, JPEG, PDF. Макс. размер: 10 МБ.
+                        </small>
+                        
+                        <!-- Отображение информации о выбранном файле -->
+                        <div v-if="selectedFile" class="file-info mt-2">
+                            <span class="badge badge-info">
+                                📎 {{ selectedFile.name }} ({{ (selectedFile.size / 1024 / 1024).toFixed(2) }} MB)
+                            </span>
+                            <button type="button" class="btn btn-sm btn-link text-danger" @click="removeSelectedFile">Удалить</button>
+                        </div>
+                    </div>
+
+                    <!-- Вывод ошибки валидации или бэкенда -->
+                    <div v-if="inquiryError" class="alert alert-danger mt-3">
+                        {{ inquiryError }}
+                    </div>
+
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" @click="closeInquiryModal" :disabled="isSubmittingInquiry">
+                        Отмена
+                    </button>
+                    <button type="submit" class="btn btn-primary" :disabled="isSubmittingInquiry || !newInquiry.targetBin">
+                        <span v-if="isSubmittingInquiry" class="spinner-border spinner-border-sm mr-1"></span>
+                        {{ isSubmittingInquiry ? 'Отправка...' : 'Отправить запрос' }}
+                    </button>
+                </div>
+            </form>
+
+        </div>
+    </div>
+</div>
+
+
+
+
+
+export default {
+    name: 'IncidentDetail',
+    data() {
+        return {
+            incident_id: this.$route.params.id || '', // ID текущего инцидента
+            incident: {
+                id: '',
+                incident_related: [] // Массив организаций [{ organization_name: "...", code: "..." }]
+            },
+            
+            // Состояние модального окна
+            showInquiryModal: false,
+            isSubmittingInquiry: false,
+            inquiryError: null,
+            selectedFile: null,
+
+            // Форма запроса
+            newInquiry: {
+                type: 'MANUAL',
+                targetBin: null, // Сохраняет org.code (БИН)
+                description: ''
+            }
+        };
+    },
+    mounted() {
+        if (this.incident_id) {
+            this.fetchIncidentInfo(this.incident_id);
+        }
+    },
+    methods: {
+        // Загрузка инцидента и связанных организаций
+        async fetchIncidentInfo(id) {
+            try {
+                const response = await axios.get(`/api/incidents/${id}`);
+                // Ожидаем структуру: { incident: { id: "...", incident_related: [...] } }
+                if (response.data && response.data.incident) {
+                    this.incident = response.data.incident;
+                }
+            } catch (err) {
+                console.error('Ошибка при загрузке инцидента:', err);
+            }
+        },
+
+        // Открытие модального окна и сброс формы
+        openInquiryModal() {
+            this.newInquiry.targetBin = null;
+            this.newInquiry.description = '';
+            this.selectedFile = null;
+            this.inquiryError = null;
+            
+            if (this.$refs.fileInput) {
+                this.$refs.fileInput.value = '';
+            }
+            this.showInquiryModal = true;
+        },
+
+        // Закрытие модалки
+        closeInquiryModal() {
+            if (!this.isSubmittingInquiry) {
+                this.showInquiryModal = false;
+            }
+        },
+
+        // Обработка и валидация файла
+        handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) {
+                this.selectedFile = null;
+                return;
+            }
+
+            // 1. Проверка размера (10 МБ = 10 * 1024 * 1024 байт)
+            const maxSize = 10 * 1024 * 1024;
+            if (file.size > maxSize) {
+                this.inquiryError = 'Размер файла превышает 10 МБ!';
+                this.removeSelectedFile();
+                return;
+            }
+
+            // 2. Проверка расширения / mime-типа
+            const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'application/pdf'];
+            const fileExt = file.name.split('.').pop().toLowerCase();
+            const allowedExts = ['png', 'jpg', 'jpeg', 'pdf'];
+
+            if (!allowedTypes.includes(file.type) && !allowedExts.includes(fileExt)) {
+                this.inquiryError = 'Разрешены только файлы PNG, JPG, JPEG и PDF!';
+                this.removeSelectedFile();
+                return;
+            }
+
+            this.inquiryError = null;
+            this.selectedFile = file;
+        },
+
+        // Удаление выбранного файла
+        removeSelectedFile() {
+            this.selectedFile = null;
+            if (this.$refs.fileInput) {
+                this.$refs.fileInput.value = '';
+            }
+        },
+
+        // Отправка формы на бэкенд
+        async submitInquiry() {
+            if (!this.newInquiry.targetBin) {
+                this.inquiryError = 'Пожалуйста, выберите целевую организацию.';
+                return;
+            }
+            if (!this.newInquiry.description.trim()) {
+                this.inquiryError = 'Пожалуйста, заполнитель описание запроса.';
+                return;
+            }
+
+            this.isSubmittingInquiry = true;
+            this.inquiryError = null;
+
+            try {
+                // Создаем FormData для передачи файлов и текстовых полей
+                const formData = new FormData();
+                formData.append('type', this.newInquiry.type);
+                formData.append('target_bin', this.newInquiry.targetBin); // 👈 БИН (code из refs)
+                formData.append('description', this.newInquiry.description);
+
+                if (this.selectedFile) {
+                    formData.append('file', this.selectedFile);
+                }
+
+                // POST запрос на Go Backend
+                await axios.post(
+                    `/api/incidents/${this.incident_id}/inquiries`, 
+                    formData, 
+                    {
+                        headers: {
+                            'Content-Type': 'multipart/form-data'
+                        }
+                    }
+                );
+
+                // Успешно отправлено
+                this.closeInquiryModal();
+                
+                // Обновляем данные на странице (например, список запросов по инциденту)
+                await this.fetchIncidentInfo(this.incident_id);
+
+            } catch (err) {
+                console.error('Ошибка при отправке запроса:', err);
+                const serverMsg = err.response?.data?.error || err.response?.data?.message;
+                this.inquiryError = serverMsg || 'Произошла ошибка при отправке запроса на сервер';
+            } finally {
+                this.isSubmittingInquiry = false;
+            }
+        }
+    }
+};
+
+
+
+.modal-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1050;
+}
+
+.modal-dialog {
+    width: 100%;
+    max-width: 550px;
+    margin: 1.75rem auto;
+}
+
+.modal-content {
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+    padding: 20px;
+}
+
+.file-info {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
