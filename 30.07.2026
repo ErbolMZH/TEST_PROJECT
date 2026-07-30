@@ -1,0 +1,232 @@
+<div v-if="showInquiryModal" class="modal-backdrop">
+    <div class="modal-content">
+        <h3>Новый запрос информации</h3>
+        
+        <form @submit.prevent="submitInquiry">
+            <!-- 1. Выбор связанной организации -->
+            <div class="form-group">
+                <label>Связанная организация *</label>
+                <select v-model="newInquiry.targetOrg" class="form-control" required>
+                    <option :value="null" disabled>Выберите организацию</option>
+                    <option v-for="org in (incident.related || incident.incident_related || [])" 
+                            :key="org.id" 
+                            :value="org.id || org.bin || org.name">
+                        {{ org.name || org.bin }} ({{ org.role || 'Организация' }})
+                    </option>
+                </select>
+            </div>
+
+            <!-- 2. Описание запроса -->
+            <div class="form-group">
+                <label>Запрашиваемая информация *</label>
+                <textarea v-model="newInquiry.description" 
+                          class="form-control" 
+                          rows="4" 
+                          placeholder="Укажите, какую информацию необходимо получить..." 
+                          required></textarea>
+            </div>
+
+            <!-- 3. Прикрепление файла (PNG, JPEG, JPG, PDF до 10 МБ) -->
+            <div class="form-group">
+                <label>Прикрепить документ/фото (PNG, JPG, PDF до 10 МБ)</label>
+                <input type="file" 
+                       ref="fileInput" 
+                       class="form-control" 
+                       accept=".png, .jpg, .jpeg, .pdf" 
+                       @change="handleFileUpload">
+                <small v-if="selectedFile" class="text-success">
+                    Выбран файл: {{ selectedFile.name }} ({{ (selectedFile.size / 1024 / 1024).toFixed(2) }} MB)
+                </small>
+            </div>
+
+            <!-- Сообщение об ошибке -->
+            <div v-if="inquiryError" class="alert alert-danger" style="margin-top: 10px;">
+                {{ inquiryError }}
+            </div>
+
+            <!-- Кнопки -->
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" @click="closeInquiryModal" :disabled="isSubmittingInquiry">
+                    Отмена
+                </button>
+                <button type="submit" class="btn btn-primary" :disabled="isSubmittingInquiry">
+                    {{ isSubmittingInquiry ? 'Отправка...' : 'Отправить запрос' }}
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+
+
+------------------------------------------------------------------------------------------------
+
+
+// Внутри объекта IncidenDetail:
+data() {
+    return {
+        // ... ваши существующие переменные ...
+        showInquiryModal: false,
+        isSubmittingInquiry: false,
+        inquiryError: null,
+        selectedFile: null, // Хранение файла
+        newInquiry: {
+            type: 'MANUAL',
+            targetOrg: null,  // Выбранная организация
+            description: ''
+        }
+    };
+},
+methods: {
+    // ... существующие методы ...
+
+    openInquiryModal() {
+        this.newInquiry.targetOrg = null;
+        this.newInquiry.description = '';
+        this.selectedFile = null;
+        this.inquiryError = null;
+        if (this.$refs.fileInput) {
+            this.$refs.fileInput.value = ''; // Сброс инпута файла
+        }
+        this.showInquiryModal = true;
+    },
+
+    closeInquiryModal() {
+        if (!this.isSubmittingInquiry) {
+            this.showInquiryModal = false;
+        }
+    },
+
+    // Обработка и валидация файла
+    handleFileUpload(event) {
+        const file = event.target.files[0];
+        if (!file) {
+            this.selectedFile = null;
+            return;
+        }
+
+        // Проверка размера (10 MB)
+        const maxSize = 10 * 1024 * 1024;
+        if (file.size > maxSize) {
+            this.inquiryError = 'Размер файла превышает 10 МБ!';
+            this.selectedFile = null;
+            event.target.value = ''; // сброс инпута
+            return;
+        }
+
+        // Проверка формата
+        const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'application/pdf'];
+        if (!allowedTypes.includes(file.type)) {
+            this.inquiryError = 'Разрешены только файлы PNG, JPG, JPEG и PDF!';
+            this.selectedFile = null;
+            event.target.value = '';
+            return;
+        }
+
+        this.inquiryError = null;
+        this.selectedFile = file;
+    },
+
+    async submitInquiry() {
+        if (!this.newInquiry.targetOrg) {
+            this.inquiryError = 'Пожалуйста, выберите организацию.';
+            return;
+        }
+        if (!this.newInquiry.description.trim()) {
+            this.inquiryError = 'Пожалуйста, укажите описание запроса.';
+            return;
+        }
+
+        this.isSubmittingInquiry = true;
+        this.inquiryError = null;
+
+        try {
+            // Если есть файл, отправляем multipart/form-data
+            const formData = new FormData();
+            formData.append('type', this.newInquiry.type);
+            formData.append('target_org', this.newInquiry.targetOrg);
+            formData.append('description', this.newInquiry.description);
+            
+            if (this.selectedFile) {
+                formData.append('file', this.selectedFile);
+            }
+
+            const response = await axios.post(
+                `/api/incidents/${this.incident_id}/inquiries`, 
+                formData, 
+                {
+                    headers: {
+                        'Content-Type': 'multipart/form-data'
+                    }
+                }
+            );
+
+            this.closeInquiryModal();
+            await this.fetchIncidentInfo(this.incident_id);
+
+        } catch (err) {
+            console.error('Submit inquiry error:', err);
+            const serverMsg = err.response?.data?.error || err.message;
+            this.inquiryError = serverMsg || 'Произошла ошибка при отправке запроса';
+        } finally {
+            this.isSubmittingInquiry = false;
+        }
+    }
+}
+
+
+-----------------------------------------------------------------------------------
+
+
+func CreateInquiryHandler(c echo.Context) error {
+	incidentID := c.Param("id")
+	
+	// 1. Получаем текстовые поля из multipart-формы
+	targetOrg := c.FormValue("target_org")
+	description := c.FormValue("description")
+	inquiryType := c.FormValue("type")
+
+	if inquiryType == "" {
+		inquiryType = "MANUAL"
+	}
+
+	// 2. Читаем файл, если он прикреплен
+	fileHeader, err := c.FormFile("file")
+	var fileBytes []byte
+	var fileName string
+
+	if err == nil && fileHeader != nil {
+		// Проверка размера файла на стороне Go (доп. защита)
+		if fileHeader.Size > 10*1024*1024 {
+			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Файл превышает 10 МБ"})
+		}
+
+		src, err := fileHeader.Open()
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Не удалось открыть файл"})
+		}
+		defer src.Close()
+
+		fileBytes, err = io.ReadAll(src)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Ошибка чтения файла"})
+		}
+		fileName = fileHeader.Filename
+	}
+
+	// 3. Формируем Payload для внешнего сервиса / БД
+	reqPayload := ExternalInquiryPayload{
+		BIN:     SenderBIN,
+		Type:    inquiryType,
+		Subject: "Запрос информации по инциденту",
+		AdditionalData: map[string]interface{}{
+			"target_organization": targetOrg,
+			"description":         description,
+			"file_name":           fileName,
+			// Файл при необходимости можно кодировать в Base64 для внешнего API:
+			// "file_base64":      base64.StdEncoding.EncodeToString(fileBytes),
+		},
+	}
+
+	// ... дальнейшая отправка и вызов SaveCreateInquiryRawTarget ...
+}
