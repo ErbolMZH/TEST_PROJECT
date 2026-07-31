@@ -1,0 +1,48 @@
+computed: {
+    // Формируем единый массив организаций для <select>
+    availableOrganizations() {
+        // 1. Если пришел детальный массив объектов с бэкенда
+        if (Array.isArray(this.incident.incident_related) && this.incident.incident_related.length > 0) {
+            return this.incident.incident_related.map(org => ({
+                code: org.code || org.bin,
+                name: org.organization_name || `Организация (${org.code || org.bin})`
+            }));
+        }
+
+        // 2. Fallback: используем поле `related` (которое отображается вверху карточки)
+        if (Array.isArray(this.incident.related) && this.incident.related.length > 0) {
+            return this.incident.related.map(item => {
+                // Если элемент - строка (просто БИН)
+                if (typeof item === 'string') {
+                    return { code: item, name: `БИН: ${item}` };
+                }
+                // Если элемент - объект { bin, name }
+                return { 
+                    code: item.code || item.bin || item.id, 
+                    name: item.name || item.organization_name || `БИН: ${item.code || item.bin}` 
+                };
+            });
+        }
+
+        return [];
+    }
+}
+
+
+<!-- Выбор связанной организации -->
+<div class="form-group">
+    <label>Связанная организация <span class="text-danger">*</span></label>
+    <select v-model="newInquiry.targetBin" class="form-control" required>
+        <option :value="null" disabled>-- Выберите организацию --</option>
+        <option 
+            v-for="(org, idx) in availableOrganizations" 
+            :key="org.code || idx" 
+            :value="org.code">
+            {{ org.name }}
+        </option>
+    </select>
+    
+    <small v-if="availableOrganizations.length === 0" class="text-warning">
+        Связанные организации не найдены для данного инцидента.
+    </small>
+</div>
