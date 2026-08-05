@@ -1,0 +1,365 @@
+CREATE OR REPLACE PROCEDURE public.P_PARSE_SUBJECT_LIST(
+    sid_JSON_subject uuid
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_VAR_VALUE text;
+    v_TEXT_MOVEMENT text;
+    k int := 0;
+
+    v_json_raw jsonb;
+    v_items_array jsonb;
+    dat RECORD;
+    dat_phone RECORD;
+    dat_card RECORD;
+    dat_IBANS RECORD;
+BEGIN
+    CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Запуск');
+
+    -- Устанавливаем статус "В работе"
+    UPDATE JSON_SUBJECT
+    SET status = 2
+    WHERE id_rec = sid_JSON_subject;
+
+    CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Взята в работу id_rec=' || sid_JSON_subject::text);
+
+    -- 1. Извлекаем сырой JSON из базы
+    SELECT JSON_ INTO v_json_raw
+    FROM JSON_SUBJECT
+    WHERE id_rec = sid_JSON_subject;
+
+    -- 2. Извлекаем именно массив "items"
+    IF jsonb_typeof(v_json_raw) = 'object' AND v_json_raw ? 'items' THEN
+        v_items_array := v_json_raw->'items';
+    ELSIF jsonb_typeof(v_json_raw) = 'array' THEN
+        v_items_array := v_json_raw;
+    ELSE
+        v_items_array := '[]'::jsonb;
+    END IF;
+
+    -- =========================================================================
+    -- ГЛАВНЫЙ ЦИКЛ: Проход по массиву субъектов из "items"
+    -- =========================================================================
+    FOR dat IN
+        SELECT * FROM jsonb_to_recordset(v_items_array) AS x(
+            id uuid,
+            "subjectType" text,
+            creation_method text,
+            identification_number text,
+            gender text,
+            name text,
+            surname text,
+            patronymic text,
+            country text,
+            type text,
+            created_date timestamp,
+            created_by text,
+            created_by_organization text,
+            source_organization text,
+            updated_date timestamp,
+            updated_by text,
+            is_deleted boolean,
+            phone_numbers jsonb,
+            card_numbers jsonb,
+            ibans jsonb
+        )
+    LOOP
+        k := k + 1;
+        CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Разбор субъекта №' || k::text || ' id=' || COALESCE(dat.id::text, 'NULL'));
+
+        ---------------- 1. Вставка / Обновление public.SUBJECT ----------------
+        INSERT INTO public.SUBJECT (
+            ID
+            ,status
+            ,"subjectType"
+            ,"creation_method"
+            ,"identification_number"
+            ,"gender"
+            ,"name"
+            ,"surname"
+            ,"patronymic"
+            ,"country"
+            ,"type"
+            ,"created_date"
+            ,"created_by"
+            ,"created_by_organization"
+            ,"source_organization"
+            ,"updated_date"
+            ,"updated_by"
+            ,"is_deleted"
+        ) VALUES (
+            dat.id
+            ,1
+            ,dat."subjectType"
+            ,dat.creation_method
+            ,dat.identification_number
+            ,dat.gender
+            ,dat.name
+            ,dat.surname
+            ,dat.patronymic
+            ,dat.country
+            ,dat.type
+            ,dat.created_date
+            ,dat.created_by
+            ,dat.created_by_organization
+            ,dat.source_organization
+            ,dat.updated_date
+            ,dat.updated_by
+            ,dat.is_deleted
+        )
+        ON CONFLICT (ID)
+        DO UPDATE SET
+            status = 3
+            ,"subjectType" = dat."subjectType"
+            ,"creation_method" = dat.creation_method
+            ,"identification_number" = dat.identification_number
+            ,"gender" = dat.gender
+            ,"name" = dat.name
+            ,"surname" = dat.surname
+            ,"patronymic" = dat.patronymic
+            ,"country" = dat.country
+            ,"type" = dat.type
+            ,"created_date" = dat.created_date
+            ,"created_by" = dat.created_by
+            ,"created_by_organization" = dat.created_by_organization
+            ,"source_organization" = dat.source_organization
+            ,"updated_date" = dat.updated_date
+            ,"updated_by" = dat.updated_by
+            ,"is_deleted" = dat.is_deleted;
+
+        ---------------- 2. Разбор телефонов для ТЕКУЩЕГО субъекта ----------------
+        IF dat.phone_numbers IS NOT NULL AND jsonb_typeof(dat.phone_numbers) = 'array' THEN
+            CALL ADD_TEXT(v_TEXT_MOVEMENT, '-Телефоны-');
+            FOR dat_phone IN
+                SELECT * FROM jsonb_to_recordset(dat.phone_numbers) AS p(
+                    id uuid,
+                    created_date timestamp,
+                    created_by text,
+                    updated_date timestamp,
+                    updated_by text,
+                    is_deleted boolean,
+                    deleted_date timestamp,
+                    deleted_by text,
+                    "incidentId" uuid,
+                    participant_id uuid,
+                    number text
+                )
+            LOOP
+                CALL ADD_TEXT(v_TEXT_MOVEMENT, 'phone id=' || COALESCE(dat_phone.id::text, 'NULL'));
+                INSERT INTO public.phone_numbers (
+                    ID
+                    ,status
+                    ,SUBJECT_ID
+                    ,"participant_id"
+                    ,"phone_number"
+                    ,"created_date"
+                    ,"created_by"
+                    ,"updated_date"
+                    ,"updated_by"
+                    ,"is_deleted"
+                    ,"deleted_date"
+                    ,"deleted_by"
+                    ,"incident_id"
+                ) VALUES (
+                    dat_phone.id
+                    ,1
+                    ,dat.id
+                    ,dat_phone.participant_id
+                    ,dat_phone.number
+                    ,dat_phone.created_date
+                    ,dat_phone.created_by
+                    ,dat_phone.updated_date
+                    ,dat_phone.updated_by
+                    ,dat_phone.is_deleted
+                    ,dat_phone.deleted_date
+                    ,dat_phone.deleted_by
+                    ,dat_phone."incidentId"
+                )
+                ON CONFLICT (ID)
+                DO UPDATE SET
+                    "participant_id" = dat_phone.participant_id
+                    ,"phone_number" = dat_phone.number
+                    ,SUBJECT_ID = dat.id
+                    ,"created_date" = dat_phone.created_date
+                    ,"created_by" = dat_phone.created_by
+                    ,"updated_date" = dat_phone.updated_date
+                    ,"updated_by" = dat_phone.updated_by
+                    ,"is_deleted" = dat_phone.is_deleted
+                    ,"deleted_date" = dat_phone.deleted_date
+                    ,"deleted_by" = dat_phone.deleted_by
+                    ,"incident_id" = dat_phone."incidentId";
+            END LOOP;
+        END IF;
+
+        ---------------- 3. Разбор банковских карт для ТЕКУЩЕГО субъекта ----------------
+        IF dat.card_numbers IS NOT NULL AND jsonb_typeof(dat.card_numbers) = 'array' THEN
+            CALL ADD_TEXT(v_TEXT_MOVEMENT, '-Карты-');
+            FOR dat_card IN
+                SELECT * FROM jsonb_to_recordset(dat.card_numbers) AS c(
+                    id uuid,
+                    created_date timestamp,
+                    created_by text,
+                    updated_date timestamp,
+                    updated_by text,
+                    is_deleted boolean,
+                    deleted_date timestamp,
+                    deleted_by text,
+                    "incidentId" uuid,
+                    issuer_bin text,
+                    card_number text
+                )
+            LOOP
+                CALL ADD_TEXT(v_TEXT_MOVEMENT, 'card id=' || COALESCE(dat_card.id::text, 'NULL'));
+                INSERT INTO public.cards (
+                    ID
+                    ,status
+                    ,SUBJECT_ID
+                    ,issuer_bin
+                    ,card_mask
+                    ,"created_date"
+                    ,"created_by"
+                    ,"updated_date"
+                    ,"updated_by"
+                    ,"is_deleted"
+                    ,"deleted_date"
+                    ,"deleted_by"
+                    ,"incident_id"
+                ) VALUES (
+                    dat_card.id
+                    ,1
+                    ,dat.id
+                    ,dat_card.issuer_bin
+                    ,dat_card.card_number
+                    ,dat_card.created_date
+                    ,dat_card.created_by
+                    ,dat_card.updated_date
+                    ,dat_card.updated_by
+                    ,dat_card.is_deleted
+                    ,dat_card.deleted_date
+                    ,dat_card.deleted_by
+                    ,dat_card."incidentId"
+                )
+                ON CONFLICT (ID)
+                DO UPDATE SET
+                    "issuer_bin" = dat_card.issuer_bin
+                    ,"card_mask" = dat_card.card_number
+                    ,SUBJECT_ID = dat.id
+                    ,"created_date" = dat_card.created_date
+                    ,"created_by" = dat_card.created_by
+                    ,"updated_date" = dat_card.updated_date
+                    ,"updated_by" = dat_card.updated_by
+                    ,"is_deleted" = dat_card.is_deleted
+                    ,"deleted_date" = dat_card.deleted_date
+                    ,"deleted_by" = dat_card.deleted_by
+                    ,"incident_id" = dat_card."incidentId";
+            END LOOP;
+        END IF;
+
+        ---------------- 4. Разбор IBAN счетов для ТЕКУЩЕГО субъекта ----------------
+        IF dat.ibans IS NOT NULL AND jsonb_typeof(dat.ibans) = 'array' THEN
+            CALL ADD_TEXT(v_TEXT_MOVEMENT, '-IBANS-');
+            FOR dat_IBANS IN
+                SELECT * FROM jsonb_to_recordset(dat.ibans) AS i(
+                    id uuid,
+                    created_date timestamp,
+                    created_by text,
+                    updated_date timestamp,
+                    updated_by text,
+                    is_deleted boolean,
+                    deleted_date timestamp,
+                    deleted_by text,
+                    "incidentId" uuid,
+                    iban text,
+                    bic text,
+                    issuer_bin text,
+                    account_currency text,
+                    account_status text,
+                    account_balance int,
+                    "isForeignAccount" boolean,
+                    participant_id text
+                )
+            LOOP
+                CALL ADD_TEXT(v_TEXT_MOVEMENT, 'IBANS id=' || COALESCE(dat_IBANS.id::text, 'NULL'));
+                INSERT INTO public.IBANS (
+                    ID
+                    ,status
+                    ,SUBJECT_ID
+                    ,"iban"
+                    ,"bic"
+                    ,"issuer_bin"
+                    ,"account_currency"
+                    ,"account_status"
+                    ,"account_balance"
+                    ,"isForeignAccount"
+                    ,"participant_id"
+                    ,"created_date"
+                    ,"created_by"
+                    ,"updated_date"
+                    ,"updated_by"
+                    ,"is_deleted"
+                    ,"deleted_date"
+                    ,"deleted_by"
+                    ,"incident_id"
+                ) VALUES (
+                    dat_IBANS.id
+                    ,1
+                    ,dat.id
+                    ,upper(encode(pgp_sym_encrypt(dat_IBANS.iban, f_get_key(), 'cipher-algo=aes256'), 'hex'))
+                    ,dat_IBANS.bic
+                    ,dat_IBANS.issuer_bin
+                    ,dat_IBANS.account_currency
+                    ,dat_IBANS.account_status
+                    ,dat_IBANS.account_balance
+                    ,dat_IBANS."isForeignAccount"
+                    ,dat_IBANS.participant_id
+                    ,dat_IBANS.created_date
+                    ,dat_IBANS.created_by
+                    ,dat_IBANS.updated_date
+                    ,dat_IBANS.updated_by
+                    ,dat_IBANS.is_deleted
+                    ,dat_IBANS.deleted_date
+                    ,dat_IBANS.deleted_by
+                    ,dat_IBANS."incidentId"
+                )
+                ON CONFLICT (ID)
+                DO UPDATE SET
+                    SUBJECT_ID = dat.id
+                    ,"iban" = upper(encode(pgp_sym_encrypt(dat_IBANS.iban, f_get_key(), 'cipher-algo=aes256'), 'hex'))
+                    ,"bic" = dat_IBANS.bic
+                    ,"issuer_bin" = dat_IBANS.issuer_bin
+                    ,"account_currency" = dat_IBANS.account_currency
+                    ,"account_status" = dat_IBANS.account_status
+                    ,"account_balance" = dat_IBANS.account_balance
+                    ,"isForeignAccount" = dat_IBANS."isForeignAccount"
+                    ,"participant_id" = dat_IBANS.participant_id
+                    ,"created_date" = dat_IBANS.created_date
+                    ,"created_by" = dat_IBANS.created_by
+                    ,"updated_date" = dat_IBANS.updated_date
+                    ,"updated_by" = dat_IBANS.updated_by
+                    ,"is_deleted" = dat_IBANS.is_deleted
+                    ,"deleted_date" = dat_IBANS.deleted_date
+                    ,"deleted_by" = dat_IBANS.deleted_by
+                    ,"incident_id" = dat_IBANS."incidentId";
+            END LOOP;
+        END IF;
+
+    END LOOP;
+
+    CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Разбор завершен. Всего обработано субъектов: ' || k::text);
+
+    -- Устанавливаем итоговый статус для всей записи в JSON_SUBJECT
+    UPDATE JSON_SUBJECT
+    SET status = 3
+    WHERE id_rec = sid_JSON_subject;
+
+    -- Логирование успеха
+    INSERT INTO public.LOG_PROC_CALC (PROC_ID, PROC_NAME, VAR_VALUE, TEXT_MOVEMENT)
+    VALUES (sid_JSON_subject, 'P_PARSE_SUBJECT_LIST', v_VAR_VALUE, v_TEXT_MOVEMENT);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        INSERT INTO public.LOG_PROC_CALC (PROC_ID, PROC_NAME, VAR_VALUE, TEXT_MOVEMENT, ERROR_TEXT)
+        VALUES (sid_JSON_subject, 'P_PARSE_SUBJECT_LIST', v_VAR_VALUE, v_TEXT_MOVEMENT, SQLSTATE || ' ' || SQLERRM);
+END;
+$$;
