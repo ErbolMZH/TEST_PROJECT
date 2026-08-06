@@ -1,0 +1,294 @@
+CREATE OR REPLACE PROCEDURE public.P_PARSE_SUBJECT_LIST(
+    sid_JSON_subject uuid
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_VAR_VALUE text;
+    v_TEXT_MOVEMENT text;
+    k int := 0;
+
+    v_json_raw json;
+    v_item json;
+    v_phone json;
+    v_card json;
+    v_iban json;
+BEGIN
+    CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Запуск');
+
+    -- 1. Устанавливаем статус "В работе" в json_list_subject по полю id_rec
+    UPDATE json_list_subject
+    SET status = 2
+    WHERE id_rec = sid_JSON_subject;
+
+    CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Взята в работу id_rec=' || sid_JSON_subject::text);
+
+    -- 2. Извлекаем JSON из json_list_subject по полю id_rec
+    SELECT JSON_ INTO v_json_raw
+    FROM json_list_subject
+    WHERE id_rec = sid_JSON_subject;
+
+    -- 3. Достаем объект "items" из корня JSON (если он обернут)
+    IF json_extract_path(v_json_raw, 'items') IS NOT NULL THEN
+        v_json_raw := v_json_raw->'items';
+    END IF;
+
+    -- =========================================================================
+    -- ГЛАВНЫЙ ЦИКЛ: Проходим по массиву элементов (тип json)
+    -- =========================================================================
+    FOR v_item IN SELECT * FROM json_array_elements(v_json_raw)
+    LOOP
+        k := k + 1;
+        CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Разбор субъекта №' || k::text || ' id=' || COALESCE(v_item->>'id', 'NULL'));
+
+        ---------------- 1. Вставка / Обновление public.SUBJECT ----------------
+        INSERT INTO public.SUBJECT (
+            ID
+            ,status
+            ,"subjectType"
+            ,"creation_method"
+            ,"identification_number"
+            ,"gender"
+            ,"name"
+            ,"surname"
+            ,"patronymic"
+            ,"country"
+            ,"type"
+            ,"created_date"
+            ,"created_by"
+            ,"created_by_organization"
+            ,"source_organization"
+            ,"updated_date"
+            ,"updated_by"
+            ,"is_deleted"
+        ) VALUES (
+            (v_item->>'id')::uuid
+            ,1
+            ,v_item->>'subjectType'
+            ,v_item->>'creation_method'
+            ,v_item->>'identification_number'
+            ,v_item->>'gender'
+            ,v_item->>'name'
+            ,v_item->>'surname'
+            ,v_item->>'patronymic'
+            ,v_item->>'country'
+            ,v_item->>'type'
+            ,(v_item->>'created_date')::timestamp
+            ,v_item->>'created_by'
+            ,v_item->>'created_by_organization'
+            ,v_item->>'source_organization'
+            ,(v_item->>'updated_date')::timestamp
+            ,v_item->>'updated_by'
+            ,(v_item->>'is_deleted')::boolean
+        )
+        ON CONFLICT (ID)
+        DO UPDATE SET
+            status = 3
+            ,"subjectType" = EXCLUDED."subjectType"
+            ,"creation_method" = EXCLUDED."creation_method"
+            ,"identification_number" = EXCLUDED."identification_number"
+            ,"gender" = EXCLUDED."gender"
+            ,"name" = EXCLUDED."name"
+            ,"surname" = EXCLUDED."surname"
+            ,"patronymic" = EXCLUDED."patronymic"
+            ,"country" = EXCLUDED."country"
+            ,"type" = EXCLUDED."type"
+            ,"created_date" = EXCLUDED."created_date"
+            ,"created_by" = EXCLUDED."created_by"
+            ,"created_by_organization" = EXCLUDED."created_by_organization"
+            ,"source_organization" = EXCLUDED."source_organization"
+            ,"updated_date" = EXCLUDED."updated_date"
+            ,"updated_by" = EXCLUDED."updated_by"
+            ,"is_deleted" = EXCLUDED."is_deleted";
+
+        ---------------- 2. Разбор телефонов ----------------
+        IF json_extract_path(v_item, 'phone_numbers') IS NOT NULL THEN
+            CALL ADD_TEXT(v_TEXT_MOVEMENT, '-Телефоны-');
+            FOR v_phone IN SELECT * FROM json_array_elements(v_item->'phone_numbers')
+            LOOP
+                CALL ADD_TEXT(v_TEXT_MOVEMENT, 'phone id=' || COALESCE(v_phone->>'id', 'NULL'));
+                INSERT INTO public.phone_numbers (
+                    ID
+                    ,status
+                    ,SUBJECT_ID
+                    ,"participant_id"
+                    ,"phone_number"
+                    ,"created_date"
+                    ,"created_by"
+                    ,"updated_date"
+                    ,"updated_by"
+                    ,"is_deleted"
+                    ,"deleted_date"
+                    ,"deleted_by"
+                    ,"incident_id"
+                ) VALUES (
+                    (v_phone->>'id')::uuid
+                    ,1
+                    ,(v_item->>'id')::uuid
+                    ,NULLIF(v_phone->>'participant_id', '')::uuid
+                    ,v_phone->>'number'
+                    ,(v_phone->>'created_date')::timestamp
+                    ,v_phone->>'created_by'
+                    ,(v_phone->>'updated_date')::timestamp
+                    ,v_phone->>'updated_by'
+                    ,(v_phone->>'is_deleted')::boolean
+                    ,(v_phone->>'deleted_date')::timestamp
+                    ,v_phone->>'deleted_by'
+                    ,NULLIF(v_phone->>'incidentId', '')::uuid
+                )
+                ON CONFLICT (ID)
+                DO UPDATE SET
+                    "participant_id" = EXCLUDED."participant_id"
+                    ,"phone_number" = EXCLUDED."phone_number"
+                    ,SUBJECT_ID = EXCLUDED.SUBJECT_ID
+                    ,"created_date" = EXCLUDED."created_date"
+                    ,"created_by" = EXCLUDED."created_by"
+                    ,"updated_date" = EXCLUDED."updated_date"
+                    ,"updated_by" = EXCLUDED."updated_by"
+                    ,"is_deleted" = EXCLUDED."is_deleted"
+                    ,"deleted_date" = EXCLUDED."deleted_date"
+                    ,"deleted_by" = EXCLUDED."deleted_by"
+                    ,"incident_id" = EXCLUDED."incident_id";
+            END LOOP;
+        END IF;
+
+        ---------------- 3. Разбор банковских карт ----------------
+        IF json_extract_path(v_item, 'card_numbers') IS NOT NULL THEN
+            CALL ADD_TEXT(v_TEXT_MOVEMENT, '-Карты-');
+            FOR v_card IN SELECT * FROM json_array_elements(v_item->'card_numbers')
+            LOOP
+                CALL ADD_TEXT(v_TEXT_MOVEMENT, 'card id=' || COALESCE(v_card->>'id', 'NULL'));
+                INSERT INTO public.cards (
+                    ID
+                    ,status
+                    ,SUBJECT_ID
+                    ,issuer_bin
+                    ,card_mask
+                    ,"created_date"
+                    ,"created_by"
+                    ,"updated_date"
+                    ,"updated_by"
+                    ,"is_deleted"
+                    ,"deleted_date"
+                    ,"deleted_by"
+                    ,"incident_id"
+                ) VALUES (
+                    (v_card->>'id')::uuid
+                    ,1
+                    ,(v_item->>'id')::uuid
+                    ,v_card->>'issuer_bin'
+                    ,v_card->>'card_number'
+                    ,(v_card->>'created_date')::timestamp
+                    ,v_card->>'created_by'
+                    ,(v_card->>'updated_date')::timestamp
+                    ,v_card->>'updated_by'
+                    ,(v_card->>'is_deleted')::boolean
+                    ,(v_card->>'deleted_date')::timestamp
+                    ,v_card->>'deleted_by'
+                    ,NULLIF(v_card->>'incidentId', '')::uuid
+                )
+                ON CONFLICT (ID)
+                DO UPDATE SET
+                    "issuer_bin" = EXCLUDED."issuer_bin"
+                    ,"card_mask" = EXCLUDED."card_mask"
+                    ,SUBJECT_ID = EXCLUDED.SUBJECT_ID
+                    ,"created_date" = EXCLUDED."created_date"
+                    ,"created_by" = EXCLUDED."created_by"
+                    ,"updated_date" = EXCLUDED."updated_date"
+                    ,"updated_by" = EXCLUDED."updated_by"
+                    ,"is_deleted" = EXCLUDED."is_deleted"
+                    ,"deleted_date" = EXCLUDED."deleted_date"
+                    ,"deleted_by" = EXCLUDED."deleted_by"
+                    ,"incident_id" = EXCLUDED."incident_id";
+            END LOOP;
+        END IF;
+
+        ---------------- 4. Разбор IBAN счетов ----------------
+        IF json_extract_path(v_item, 'ibans') IS NOT NULL THEN
+            CALL ADD_TEXT(v_TEXT_MOVEMENT, '-IBANS-');
+            FOR v_iban IN SELECT * FROM json_array_elements(v_item->'ibans')
+            LOOP
+                CALL ADD_TEXT(v_TEXT_MOVEMENT, 'IBANS id=' || COALESCE(v_iban->>'id', 'NULL'));
+                INSERT INTO public.IBANS (
+                    ID
+                    ,status
+                    ,SUBJECT_ID
+                    ,"iban"
+                    ,"bic"
+                    ,"issuer_bin"
+                    ,"account_currency"
+                    ,"account_status"
+                    ,"account_balance"
+                    ,"isForeignAccount"
+                    ,"participant_id"
+                    ,"created_date"
+                    ,"created_by"
+                    ,"updated_date"
+                    ,"updated_by"
+                    ,"is_deleted"
+                    ,"deleted_date"
+                    ,"deleted_by"
+                    ,"incident_id"
+                ) VALUES (
+                    (v_iban->>'id')::uuid
+                    ,1
+                    ,(v_item->>'id')::uuid
+                    ,CASE WHEN v_iban->>'iban' IS NOT NULL 
+                          THEN upper(encode(pgp_sym_encrypt(v_iban->>'iban', f_get_key(), 'cipher-algo=aes256'), 'hex')) 
+                          ELSE NULL END
+                    ,v_iban->>'bic'
+                    ,v_iban->>'issuer_bin'
+                    ,v_iban->>'account_currency'
+                    ,v_iban->>'account_status'
+                    ,(v_iban->>'account_balance')::int
+                    ,(v_iban->>'isForeignAccount')::boolean
+                    ,v_iban->>'participant_id'
+                    ,(v_iban->>'created_date')::timestamp
+                    ,v_iban->>'created_by'
+                    ,(v_iban->>'updated_date')::timestamp
+                    ,v_iban->>'updated_by'
+                    ,(v_iban->>'is_deleted')::boolean
+                    ,(v_iban->>'deleted_date')::timestamp
+                    ,v_iban->>'deleted_by'
+                    ,NULLIF(v_iban->>'incidentId', '')::uuid
+                )
+                ON CONFLICT (ID)
+                DO UPDATE SET
+                    SUBJECT_ID = EXCLUDED.SUBJECT_ID
+                    ,"iban" = EXCLUDED."iban"
+                    ,"bic" = EXCLUDED."bic"
+                    ,"issuer_bin" = EXCLUDED."issuer_bin"
+                    ,"account_currency" = EXCLUDED."account_currency"
+                    ,"account_status" = EXCLUDED."account_status"
+                    ,"account_balance" = EXCLUDED."account_balance"
+                    ,"isForeignAccount" = EXCLUDED."isForeignAccount"
+                    ,"participant_id" = EXCLUDED."participant_id"
+                    ,"created_date" = EXCLUDED."created_date"
+                    ,"created_by" = EXCLUDED."created_by"
+                    ,"updated_date" = EXCLUDED."updated_date"
+                    ,"updated_by" = EXCLUDED."updated_by"
+                    ,"is_deleted" = EXCLUDED."is_deleted"
+                    ,"deleted_date" = EXCLUDED."deleted_date"
+                    ,"deleted_by" = EXCLUDED."deleted_by"
+                    ,"incident_id" = EXCLUDED."incident_id";
+            END LOOP;
+        END IF;
+
+    END LOOP;
+
+    CALL ADD_TEXT(v_TEXT_MOVEMENT, 'Разбор завершен. Всего обработано субъектов: ' || k::text);
+
+    -- Устанавливаем статус 3 в json_list_subject по полю id_rec
+    UPDATE json_list_subject
+    SET status = 3
+    WHERE id_rec = sid_JSON_subject;
+
+    INSERT INTO public.LOG_PROC_CALC (PROC_ID, PROC_NAME, VAR_VALUE, TEXT_MOVEMENT)
+    VALUES (sid_JSON_subject, 'P_PARSE_SUBJECT_LIST', v_VAR_VALUE, v_TEXT_MOVEMENT);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        INSERT INTO public.LOG_PROC_CALC (PROC_ID, PROC_NAME, VAR_VALUE, TEXT_MOVEMENT, ERROR_TEXT)
+        VALUES (sid_JSON_subject, 'P_PARSE_SUBJECT_LIST', v_VAR_VALUE, v_TEXT_MOVEMENT, SQLSTATE || ' ' || SQLERRM);
+END;
+$$;
